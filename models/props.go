@@ -1,9 +1,9 @@
 package models
 
 type IndexRouteProps struct {
- Articles []Article `json:"articles"`
+	Articles []Article `json:"articles"`
 }
 
 type ArticleRouteProps struct {
- Article Article `json:"article"`
+	Article Article `json:"article"`
 }

@@ -1,4 +1,4 @@
-import { ArticleRouteProps } from '../generated';
+import { ArticleRouteProps } from '../utils/types';
 import Header from './Header';
 
 const Article = ({ article }: ArticleRouteProps) => (
