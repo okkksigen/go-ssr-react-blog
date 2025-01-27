@@ -5,3 +5,7 @@
 body {
   background-color: #f0f2f6 ;
 }
+
+html {
+  @apply font-sans;
+}
