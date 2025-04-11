@@ -9,11 +9,13 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"example.com/gin/models"
 
 	"github.com/gin-gonic/gin"
 	gossr "github.com/natewong1313/go-react-ssr"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -28,6 +30,51 @@ var s3Endpoint string
 var accessKeyID string
 var secretAccessKey string
 var s3Region string
+
+const cacheExpiration = time.Hour
+
+var RedisClient *redis.Client
+
+func InitRedis() {
+	RedisClient = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+
+	ctx := context.Background()
+	pong, err := RedisClient.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
+	fmt.Println("Connected to Redis! Pong:", pong)
+}
+
+func GetCachedHTML(ctx context.Context, key string) (string, error) {
+	val, err := RedisClient.Get(ctx, key).Result()
+	if err == redis.Nil {
+		return "", nil
+	} else if err != nil {
+		return "", fmt.Errorf("failed to get from Redis: %w", err)
+	}
+	return val, nil
+}
+
+func SetCachedHTML(ctx context.Context, key string, html string, expiration time.Duration) error {
+	err := RedisClient.Set(ctx, key, html, expiration).Err()
+	if err != nil {
+		return fmt.Errorf("failed to set in Redis: %w", err)
+	}
+	return nil
+}
+
+func InvalidateCache(ctx context.Context, key string) error {
+	err := RedisClient.Del(ctx, key).Err()
+	if err != nil {
+		return fmt.Errorf("failed to delete key '%s' from Redis: %w", key, err)
+	}
+	return nil
+}
 
 func init() {
 	bucketName = os.Getenv("S3_BUCKET_NAME")
@@ -52,70 +99,87 @@ func init() {
 }
 
 func loadArticlesFromJSON() ([]models.Article, error) {
-  jsonPath := "./data/articles.json"
+	jsonPath := "./data/articles.json"
 
-  file, err := os.ReadFile(jsonPath)
-  if err != nil {
-    return nil, fmt.Errorf("Failed to read articles.json: %w", err)
-  }
+	file, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read articles.json: %w", err)
+	}
 
-  var articles []models.Article
-  if err := json.Unmarshal(file, &articles); err != nil {
-    return nil, fmt.Errorf("Failed to unmarshal articles.json: %w", err)
-  }
+	var articles []models.Article
+	if err := json.Unmarshal(file, &articles); err != nil {
+		return nil, fmt.Errorf("Failed to unmarshal articles.json: %w", err)
+	}
 
-  return articles, nil
+	return articles, nil
 }
 
 func main() {
-  models.InitDB()
+	models.InitDB()
+	InitRedis()
 
-  articles, err := models.LoadArticles()
+	articles, err := models.LoadArticles()
 
-  if err != nil {
-    log.Fatalf("Failed to load articles: %v", err)
-  }
+	if err != nil {
+		log.Fatalf("Failed to load articles: %v", err)
+	}
 
-  if len(articles) == 0 {
-    fmt.Println("Database is empty, attempting to load from JSON...")
-    articlesFromJSON, err := loadArticlesFromJSON()
-    if err != nil {
-      log.Fatalf("Failed to load articles from json: %v", err)
-    }
-    fmt.Println("JSON data loaded successfully. Number of articles:", len(articlesFromJSON))
-    err = models.InsertArticles(articlesFromJSON)
-    if err != nil {
-      log.Fatalf("Failed to insert articles into database: %v", err)
-    }
-    fmt.Println("Data inserted successfully.")
+	if len(articles) == 0 {
+		fmt.Println("Database is empty, attempting to load from JSON...")
+		articlesFromJSON, err := loadArticlesFromJSON()
+		if err != nil {
+			log.Fatalf("Failed to load articles from json: %v", err)
+		}
+		fmt.Println("JSON data loaded successfully. Number of articles:", len(articlesFromJSON))
+		err = models.InsertArticles(articlesFromJSON)
+		if err != nil {
+			log.Fatalf("Failed to insert articles into database: %v", err)
+		}
+		fmt.Println("Data inserted successfully.")
 
-    articles, err = models.LoadArticles()
-    if err != nil {
-      log.Fatalf("Failed to load articles from database after insert: %v", err)
-    }
-  }
+		articles, err = models.LoadArticles()
+		if err != nil {
+			log.Fatalf("Failed to load articles from database after insert: %v", err)
+		}
+	}
 
-  fmt.Printf("Number of articles loaded from DB: %d\n", len(articles))
+	fmt.Printf("Number of articles loaded from DB: %d\n", len(articles))
 
-  g := gin.Default()
-  g.StaticFile("favicon.ico", "./frontend/public/favicon.ico")
-  g.Static("/assets", "./frontend/public")
+	g := gin.Default()
+	g.StaticFile("favicon.ico", "./frontend/public/favicon.ico")
+	g.Static("/assets", "./frontend/public")
 
-  engine, err := gossr.New(gossr.Config{
-    AppEnv:             APP_ENV,
-    AssetRoute:         "/assets",
-    FrontendDir:        "./frontend/src",
-    GeneratedTypesPath: "./frontend/src/generated.d.ts",
-    TailwindConfigPath: "./frontend/tailwind.config.js",
-    LayoutCSSFilePath:  "Main.css",
-    PropsStructsPath:   "./models/props.go",
-  })
-  if err != nil {
-    log.Fatal("Failed to init go-react-ssr")
-  }
+	engine, err := gossr.New(gossr.Config{
+		AppEnv:             APP_ENV,
+		AssetRoute:         "/assets",
+		FrontendDir:        "./frontend/src",
+		GeneratedTypesPath: "./frontend/src/generated.d.ts",
+		TailwindConfigPath: "./frontend/tailwind.config.js",
+		LayoutCSSFilePath:  "Main.css",
+		PropsStructsPath:   "./models/props.go",
+	})
+	if err != nil {
+		log.Fatal("Failed to init go-react-ssr")
+	}
 
 	g.GET("/", func(c *gin.Context) {
+		ctx := context.Background()
+
 		objectKey := "index.html"
+		cacheKey := "home_page"
+
+		cachedHTML, err := GetCachedHTML(ctx, cacheKey)
+		if err != nil {
+			log.Printf("Error getting cached HTML from Redis: %v", err)
+		}
+
+		if cachedHTML != "" {
+			log.Println("Cache hit for home page!")
+			c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(cachedHTML))
+			return
+		}
+
+		log.Println("Cache miss for home page, rendering...")
 
 		renderedResponse := engine.RenderRoute(gossr.RenderConfig{
 			File:     "pages/Home.tsx",
@@ -130,7 +194,7 @@ func main() {
 		})
 		htmlContent := string(renderedResponse)
 
-		err := uploadHTMLToS3(bucketName, objectKey, htmlContent)
+		err = uploadHTMLToS3(bucketName, objectKey, htmlContent)
 		if err != nil {
 			log.Printf("Error uploading to S3: %v", err)
 			c.String(http.StatusInternalServerError, "Failed to upload to S3")
@@ -144,11 +208,31 @@ func main() {
 			return
 		}
 
+		err = SetCachedHTML(ctx, cacheKey, htmlFromS3, cacheExpiration)
+		if err != nil {
+			log.Printf("Error setting cached HTML in Redis: %v", err)
+		}
+
 		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(htmlFromS3))
 	})
 
 	g.GET("/articles/:slug", func(c *gin.Context) {
 		slug := c.Param("slug")
+		ctx := context.Background()
+		cacheKey := fmt.Sprintf("article:%s", slug)
+
+		cachedHTML, err := GetCachedHTML(ctx, cacheKey)
+		if err != nil {
+			log.Printf("Error getting cached HTML from Redis: %v", err)
+		}
+
+		if cachedHTML != "" {
+			log.Println("Cache hit for article:", slug)
+			c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(cachedHTML))
+			return
+		}
+
+		log.Println("Cache miss for article:", slug, "rendering...")
 		currentArticle, err := models.GetArticleBySlug(slug)
 		if err != nil {
 			c.Status(http.StatusNotFound)
@@ -184,9 +268,24 @@ func main() {
 			return
 		}
 
+		err = SetCachedHTML(ctx, cacheKey, htmlFromS3, cacheExpiration)
+		if err != nil {
+			log.Printf("Error setting cached HTML in Redis: %v", err)
+		}
+
 		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(htmlFromS3))
 	})
 	g.Run(":8080")
+}
+
+func InvalidateArticleCache(slug string) error {
+	ctx := context.Background()
+	cacheKey := fmt.Sprintf("article:%s", slug)
+	err := InvalidateCache(ctx, cacheKey)
+	if err != nil {
+		return fmt.Errorf("failed to invalidate cache for article '%s': %w", slug, err)
+	}
+	return nil
 }
 
 func uploadHTMLToS3(bucketName, objectKey, htmlContent string) error {
@@ -219,9 +318,9 @@ func uploadHTMLToS3(bucketName, objectKey, htmlContent string) error {
 	body := bytes.NewReader([]byte(htmlContent))
 
 	_, err = uploader.Upload(context.TODO(), &s3.PutObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(objectKey),
-		Body:   body,
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(objectKey),
+		Body:        body,
 		ContentType: aws.String("text/html"),
 	})
 	if err != nil {
